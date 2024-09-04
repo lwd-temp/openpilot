@@ -17,12 +17,14 @@ import cereal.messaging as messaging
 from cereal import car
 from cereal.services import SERVICE_LIST
 from msgq.visionipc import VisionIpcServer, get_endpoint_name as vipc_get_endpoint_name
+from opendbc.car import structs
+from opendbc.car.car_helpers import get_car, interfaces
 from openpilot.common.params import Params
 from openpilot.common.prefix import OpenpilotPrefix
 from openpilot.common.timeout import Timeout
 from openpilot.common.realtime import DT_CTRL
 from panda.python import ALTERNATIVE_EXPERIENCE
-from openpilot.selfdrive.car.car_helpers import get_car, interfaces
+from openpilot.selfdrive.car.card import can_comm_callbacks, convert_to_capnp
 from openpilot.system.manager.process_config import managed_processes
 from openpilot.selfdrive.test.process_replay.vision_meta import meta_from_camera_state, available_streams
 from openpilot.selfdrive.test.process_replay.migration import migrate_all
@@ -335,33 +337,40 @@ def card_fingerprint_callback(rc, pm, msgs, fingerprint):
 
     m = canmsgs.pop(0)
     rc.send_sync(pm, "can", m.as_builder().to_bytes())
-    rc.wait_for_next_recv(False)
+    rc.wait_for_next_recv(True)
 
 
 def get_car_params_callback(rc, pm, msgs, fingerprint):
   params = Params()
   if fingerprint:
-    CarInterface, _, _ = interfaces[fingerprint]
+    CarInterface, _, _, _ = interfaces[fingerprint]
     CP = CarInterface.get_non_essential_params(fingerprint)
   else:
     can = DummySocket()
     sendcan = DummySocket()
 
     canmsgs = [msg for msg in msgs if msg.which() == "can"]
-    has_cached_cp = params.get("CarParamsCache") is not None
+    cached_params_raw = params.get("CarParamsCache")
+    has_cached_cp = cached_params_raw is not None
     assert len(canmsgs) != 0, "CAN messages are required for fingerprinting"
     assert os.environ.get("SKIP_FW_QUERY", False) or has_cached_cp, \
             "CarParamsCache is required for fingerprinting. Make sure to keep carParams msgs in the logs."
 
     for m in canmsgs[:300]:
       can.send(m.as_builder().to_bytes())
-    _, CP = get_car(can, sendcan, Params().get_bool("ExperimentalLongitudinalEnabled"))
+    can_callbacks = can_comm_callbacks(can, sendcan)
+
+    cached_params = None
+    if has_cached_cp:
+      with car.CarParams.from_bytes(cached_params_raw) as _cached_params:
+        cached_params = structs.CarParams(carName=_cached_params.carName, carFw=_cached_params.carFw, carVin=_cached_params.carVin)
+
+    CP = get_car(*can_callbacks, lambda obd: None, Params().get_bool("ExperimentalLongitudinalEnabled"), cached_params=cached_params).CP
 
     if not params.get_bool("DisengageOnAccelerator"):
       CP.alternativeExperience |= ALTERNATIVE_EXPERIENCE.DISABLE_DISENGAGE_ON_GAS
 
-  params.put("CarParams", CP.to_bytes())
-  return CP
+  params.put("CarParams", convert_to_capnp(CP).to_bytes())
 
 
 def controlsd_rcv_callback(msg, cfg, frame):
@@ -444,18 +453,10 @@ class FrequencyBasedRcvCallback:
 
 
 def controlsd_config_callback(params, cfg, lr):
-  controlsState = None
-  initialized = False
-  for msg in lr:
-    if msg.which() == "controlsState":
-      controlsState = msg.controlsState
-      if initialized:
-        break
-    elif msg.which() == "onroadEvents":
-      initialized = car.CarEvent.EventName.controlsInitializing not in [e.name for e in msg.onroadEvents]
+  ublox = params.get_bool("UbloxAvailable")
+  sub_keys = ({"gpsLocation", } if ublox else {"gpsLocationExternal", })
 
-  assert controlsState is not None and initialized, "controlsState never initialized"
-  params.put("ReplayControlsState", controlsState.as_builder().to_bytes())
+  cfg.pubs = set(cfg.pubs) - sub_keys
 
 
 def locationd_config_pubsub_callback(params, cfg, lr):
@@ -470,12 +471,13 @@ CONFIGS = [
     proc_name="controlsd",
     pubs=[
       "carState", "deviceState", "pandaStates", "peripheralState", "liveCalibration", "driverMonitoringState",
-      "longitudinalPlan", "liveLocationKalman", "liveParameters", "radarState",
+      "longitudinalPlan", "livePose", "liveParameters", "radarState",
       "modelV2", "driverCameraState", "roadCameraState", "wideRoadCameraState", "managerState",
-      "testJoystick", "liveTorqueParameters", "accelerometer", "gyroscope", "carOutput"
+      "testJoystick", "liveTorqueParameters", "accelerometer", "gyroscope", "carOutput",
+      "gpsLocationExternal", "gpsLocation",
     ],
-    subs=["controlsState", "carControl", "onroadEvents"],
-    ignore=["logMonoTime", "controlsState.startMonoTime", "controlsState.cumLagMs"],
+    subs=["selfdriveState", "controlsState", "carControl", "onroadEvents"],
+    ignore=["logMonoTime", "controlsState.cumLagMs"],
     config_callback=controlsd_config_callback,
     init_callback=get_car_params_callback,
     should_recv_callback=controlsd_rcv_callback,
@@ -504,7 +506,7 @@ CONFIGS = [
   ),
   ProcessConfig(
     proc_name="plannerd",
-    pubs=["modelV2", "carControl", "carState", "controlsState", "radarState"],
+    pubs=["modelV2", "carControl", "carState", "controlsState", "radarState", "selfdriveState"],
     subs=["longitudinalPlan"],
     ignore=["logMonoTime", "longitudinalPlan.processingDelay", "longitudinalPlan.solverExecutionTime"],
     init_callback=get_car_params_callback,
@@ -520,7 +522,7 @@ CONFIGS = [
   ),
   ProcessConfig(
     proc_name="dmonitoringd",
-    pubs=["driverStateV2", "liveCalibration", "carState", "modelV2", "controlsState"],
+    pubs=["driverStateV2", "liveCalibration", "carState", "modelV2", "selfdriveState"],
     subs=["driverMonitoringState"],
     ignore=["logMonoTime"],
     should_recv_callback=FrequencyBasedRcvCallback("driverStateV2"),
@@ -532,7 +534,7 @@ CONFIGS = [
       "cameraOdometry", "accelerometer", "gyroscope", "gpsLocationExternal",
       "liveCalibration", "carState", "gpsLocation"
     ],
-    subs=["liveLocationKalman", "livePose"],
+    subs=["livePose"],
     ignore=["logMonoTime"],
     config_callback=locationd_config_pubsub_callback,
     tolerance=NUMPY_TOLERANCE,
@@ -808,8 +810,8 @@ def check_openpilot_enabled(msgs: LogIterable) -> bool:
     if msg.which() == "carParams":
       if msg.carParams.notCar:
         return True
-    elif msg.which() == "controlsState":
-      if msg.controlsState.active:
+    elif msg.which() == "selfdriveState":
+      if msg.selfdriveState.active:
         cur_enabled_count += 1
       else:
         cur_enabled_count = 0
